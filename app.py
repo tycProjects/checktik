@@ -1,11 +1,45 @@
 import re
 import math
+import subprocess
 from flask import Flask, request, jsonify, send_from_directory
 import yt_dlp
+import imageio_ffmpeg
 
 app = Flask(__name__, static_folder="static")
 
 TIKTOK_URL_RE = re.compile(r"tiktok\.com", re.IGNORECASE)
+FPS_LINE_RE = re.compile(r"(\d+(?:\.\d+)?)\s+fps")
+
+FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
+
+
+def probe_fps(raw_format):
+    """Fall back to reading the real frame rate straight off the video
+    when TikTok's own metadata doesn't report one. Only reads enough of
+    the file to see the stream header, not the whole clip."""
+    url = raw_format.get("url")
+    if not url:
+        return None
+
+    cmd = [FFMPEG_BIN]
+    headers = raw_format.get("http_headers") or {}
+    if headers:
+        header_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+        cmd += ["-headers", header_str]
+    cmd += ["-i", url, "-t", "0.2", "-f", "null", "-"]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+    match = FPS_LINE_RE.search(proc.stderr)
+    if match:
+        try:
+            return float(match.group(1))
+        except ValueError:
+            return None
+    return None
 
 
 def human_size(num_bytes):
@@ -67,13 +101,26 @@ def check():
     except Exception as e:
         return jsonify({"error": f"Unexpected error: {e}"}), 500
 
-    formats = [format_entry(f) for f in info.get("formats", []) if f.get("vcodec") not in (None, "none")]
+    raw_video_formats = [f for f in info.get("formats", []) if f.get("vcodec") not in (None, "none")]
+    formats = [format_entry(f) for f in raw_video_formats]
 
     # Pick the "best" as the highest-resolution format with both video+audio, falling back to highest res video-only
     def score(f):
         return (f["width"] or 0) * (f["height"] or 0)
 
-    best = max(formats, key=score) if formats else None
+    best = None
+    best_raw = None
+    if formats:
+        best_index = max(range(len(formats)), key=lambda i: score(formats[i]))
+        best = formats[best_index]
+        best_raw = raw_video_formats[best_index]
+
+    # TikTok doesn't always report fps in its own metadata. Try the
+    # video-level field first (free), then probe the actual file (slower).
+    if best and not best.get("fps"):
+        best["fps"] = info.get("fps")
+    if best and not best.get("fps") and best_raw:
+        best["fps"] = probe_fps(best_raw)
 
     duration = info.get("duration")
     result = {
