@@ -1,6 +1,9 @@
 import re
 import math
+import os
+import tempfile
 import subprocess
+import requests
 from flask import Flask, request, jsonify, send_from_directory
 import yt_dlp
 import imageio_ffmpeg
@@ -13,32 +16,60 @@ FPS_LINE_RE = re.compile(r"(\d+(?:\.\d+)?)\s+fps")
 FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
 
 
-def probe_fps(raw_format):
-    """Fall back to reading the real frame rate straight off the video
-    when TikTok's own metadata doesn't report one. Only reads enough of
-    the file to see the stream header, not the whole clip."""
+def download_temp(raw_format, max_bytes=40 * 1024 * 1024, timeout=20):
+    """Pull the clip down to a temp file so ffmpeg can read it locally.
+    Probing the CDN URL directly gets blocked or truncated too often to
+    be reliable, so a real local copy is used instead."""
     url = raw_format.get("url")
     if not url:
         return None
-
-    cmd = [FFMPEG_BIN]
     headers = raw_format.get("http_headers") or {}
-    if headers:
-        header_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
-        cmd += ["-headers", header_str]
-    cmd += ["-i", url, "-t", "0.2", "-f", "null", "-"]
 
+    path = None
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
-    except (subprocess.TimeoutExpired, OSError):
+        with requests.get(url, headers=headers, stream=True, timeout=timeout) as r:
+            r.raise_for_status()
+            fd, path = tempfile.mkstemp(suffix=".mp4")
+            size = 0
+            with os.fdopen(fd, "wb") as f:
+                for chunk in r.iter_content(chunk_size=262144):
+                    if not chunk:
+                        continue
+                    f.write(chunk)
+                    size += len(chunk)
+                    if size > max_bytes:
+                        break
+        return path
+    except Exception as e:
+        app.logger.warning(f"fps probe download failed: {e}")
+        if path and os.path.exists(path):
+            os.remove(path)
         return None
 
-    match = FPS_LINE_RE.search(proc.stderr)
-    if match:
-        try:
+
+def probe_fps(raw_format):
+    """Fall back to reading the real frame rate off the downloaded file
+    when TikTok's own metadata doesn't report one."""
+    path = download_temp(raw_format)
+    if not path:
+        return None
+
+    try:
+        proc = subprocess.run(
+            [FFMPEG_BIN, "-i", path, "-t", "0.1", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=15,
+        )
+        match = FPS_LINE_RE.search(proc.stderr)
+        if match:
             return float(match.group(1))
-        except ValueError:
-            return None
+        app.logger.warning(f"fps probe found no match. stderr tail: {proc.stderr[-400:]}")
+    except (subprocess.TimeoutExpired, OSError) as e:
+        app.logger.warning(f"fps probe ffmpeg run failed: {e}")
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
     return None
 
 
