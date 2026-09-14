@@ -406,7 +406,10 @@ function measureFpsFromVideo(url, timeoutMs = 9000) {
       video.play().catch((err) => finish(null, `play() failed: ${err}`));
     });
     video.addEventListener('error', () => {
-      finish(null, `video failed to load: ${video.error ? video.error.message : 'unknown'}`);
+      const err = video.error;
+      const codeNames = { 1: 'ABORTED', 2: 'NETWORK', 3: 'DECODE', 4: 'SRC_NOT_SUPPORTED' };
+      const detail = err ? `code ${err.code} (${codeNames[err.code] || 'unknown'})${err.message ? ': ' + err.message : ''}` : 'unknown error';
+      finish(null, `video failed to load — ${detail}`);
     });
   });
 }
@@ -487,7 +490,7 @@ form.addEventListener('submit', async (e) => {
         fpsEl.textContent = measured ? fmtFps(measured) : 'not reported';
         lastSummary = lastSummary.replace(/Frame rate: .*/, `Frame rate: ${measured ? fmtFps(measured) : 'not reported'}`);
         if (!measured) {
-          debugEl.textContent = `debug: ${reason}`;
+          debugEl.innerHTML = `debug: ${reason}<br><a href="${best.play_url}" target="_blank" rel="noopener" style="color:var(--purple);">open raw video URL directly →</a>`;
           debugEl.style.display = 'block';
         }
       });
