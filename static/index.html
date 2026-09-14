@@ -341,6 +341,58 @@ function fmtBitrate(kbps) {
   return kbps >= 1000 ? `${(kbps / 1000).toFixed(2)} Mbps` : `${kbps} kbps`;
 }
 
+// TikTok's CDN blocks server-side (datacenter) requests, but the visitor's
+// own browser can reach it fine — same as watching TikTok normally. So when
+// the backend doesn't report an fps, measure it locally by playing a couple
+// seconds of the actual clip (muted, hidden) and counting real frames via
+// requestVideoFrameCallback.
+function measureFpsFromVideo(url, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    if (!url || !('requestVideoFrameCallback' in HTMLVideoElement.prototype)) {
+      resolve(null);
+      return;
+    }
+    const video = document.createElement('video');
+    video.src = url;
+    video.muted = true;
+    video.playsInline = true;
+    video.crossOrigin = 'anonymous';
+    video.style.cssText = 'position:fixed;width:1px;height:1px;opacity:0;pointer-events:none;';
+    document.body.appendChild(video);
+
+    const samples = [];
+    let done = false;
+    const finish = (fps) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      video.pause();
+      video.remove();
+      resolve(fps);
+    };
+    const timer = setTimeout(() => finish(null), timeoutMs);
+
+    function onFrame(_now, metadata) {
+      samples.push(metadata);
+      if (samples.length < 15) {
+        video.requestVideoFrameCallback(onFrame);
+        return;
+      }
+      const a = samples[0];
+      const b = samples[samples.length - 1];
+      const dt = b.mediaTime - a.mediaTime;
+      const df = b.presentedFrames - a.presentedFrames;
+      finish(dt > 0 && df > 0 ? df / dt : null);
+    }
+
+    video.addEventListener('loadeddata', () => {
+      video.play().catch(() => finish(null));
+      video.requestVideoFrameCallback(onFrame);
+    });
+    video.addEventListener('error', () => finish(null));
+  });
+}
+
 function setLoading(loading) {
   submitBtn.disabled = loading;
   spinner.style.display = loading ? 'block' : 'none';
@@ -407,6 +459,15 @@ form.addEventListener('submit', async (e) => {
     document.getElementById('filesize').textContent = best.filesize_human || 'not reported';
     document.getElementById('duration').textContent = fmtDuration(data.duration_seconds);
     document.getElementById('ext').textContent = (best.ext || '–').toUpperCase();
+
+    if (!best.fps && best.play_url) {
+      const fpsEl = document.getElementById('fps');
+      fpsEl.textContent = 'measuring…';
+      measureFpsFromVideo(best.play_url).then((measured) => {
+        fpsEl.textContent = measured ? fmtFps(measured) : 'not reported';
+        lastSummary = lastSummary.replace(/Frame rate: .*/, `Frame rate: ${measured ? fmtFps(measured) : 'not reported'}`);
+      });
+    }
 
     formatsBody.innerHTML = '';
     (data.formats || []).forEach(f => {
