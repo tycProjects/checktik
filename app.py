@@ -39,7 +39,14 @@ def fetch_tikwm_play_url(tiktok_url, timeout=15):
         resp = requests.get(
             TIKWM_API_URL,
             params={"url": tiktok_url},
-            headers={"User-Agent": "Mozilla/5.0 (compatible; fps-probe/1.0)"},
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+                ),
+                "Referer": "https://tikwm.com/",
+                "Accept": "application/json, text/plain, */*",
+            },
             timeout=timeout,
         )
         resp.raise_for_status()
@@ -50,7 +57,10 @@ def fetch_tikwm_play_url(tiktok_url, timeout=15):
         data = payload.get("data") or {}
         return data.get("hdplay") or data.get("play")
     except Exception as e:
-        app.logger.warning(f"tikwm lookup failed: {e}")
+        body_hint = ""
+        if hasattr(e, "response") and e.response is not None:
+            body_hint = f" | body: {e.response.text[:200]}"
+        app.logger.warning(f"tikwm lookup failed: {e}{body_hint}")
         return None
 
 
@@ -59,11 +69,18 @@ def probe_fps_from_url(url, headers=None, max_bytes=40 * 1024 * 1024, timeout=20
     with ffmpeg."""
     if not url:
         return None
+    req_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        )
+    }
+    req_headers.update(headers or {})
     path = None
     try:
         with requests.get(
             url,
-            headers=headers or {},
+            headers=req_headers,
             stream=True,
             timeout=timeout,
             proxies=PROBE_PROXIES if use_proxy else None,
