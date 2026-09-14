@@ -15,6 +15,15 @@ FPS_LINE_RE = re.compile(r"(\d+(?:\.\d+)?)\s+fps")
 
 FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
 
+# TikTok's video CDN (v16-webapp-prime.us.tiktok.com etc.) blocks requests
+# from known datacenter/hosting IP ranges with a 403, which breaks the fps
+# probe on Render (and most other cloud hosts). Routing the download through
+# a residential/mobile proxy avoids that block. Set PROBE_PROXY_URL in the
+# environment, e.g. http://user:pass@proxy-host:port — works for both http
+# and https since it's passed as the scheme for both.
+PROBE_PROXY_URL = os.environ.get("PROBE_PROXY_URL")
+PROBE_PROXIES = {"http": PROBE_PROXY_URL, "https": PROBE_PROXY_URL} if PROBE_PROXY_URL else None
+
 
 def download_temp(raw_format, max_bytes=40 * 1024 * 1024, timeout=20):
     """Pull the clip down to a temp file so ffmpeg can read it locally.
@@ -27,7 +36,9 @@ def download_temp(raw_format, max_bytes=40 * 1024 * 1024, timeout=20):
 
     path = None
     try:
-        with requests.get(url, headers=headers, stream=True, timeout=timeout) as r:
+        with requests.get(
+            url, headers=headers, stream=True, timeout=timeout, proxies=PROBE_PROXIES
+        ) as r:
             r.raise_for_status()
             fd, path = tempfile.mkstemp(suffix=".mp4")
             size = 0
@@ -105,6 +116,7 @@ def format_entry(f):
         "filesize_human": human_size(filesize) if filesize else None,
         "note": f.get("format_note"),
         "has_watermark_hint": "watermark" in (f.get("format_note") or "").lower(),
+        "play_url": f.get("url"),
     }
 
 
@@ -150,8 +162,11 @@ def check():
     # video-level field first (free), then probe the actual file (slower).
     if best and not best.get("fps"):
         best["fps"] = info.get("fps")
-    if best and not best.get("fps") and best_raw:
+    if best and not best.get("fps") and best_raw and PROBE_PROXIES:
         best["fps"] = probe_fps(best_raw)
+
+    if best and best.get("fps") is None:
+        best["fps_note"] = "not reported by TikTok for this video"
 
     duration = info.get("duration")
     result = {
