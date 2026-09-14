@@ -346,52 +346,67 @@ function fmtBitrate(kbps) {
 // the backend doesn't report an fps, measure it locally by playing a couple
 // seconds of the actual clip (muted, hidden) and counting real frames via
 // requestVideoFrameCallback.
-function measureFpsFromVideo(url, timeoutMs = 5000) {
+function measureFpsFromVideo(url, timeoutMs = 9000) {
   return new Promise((resolve) => {
-    if (!url || !('requestVideoFrameCallback' in HTMLVideoElement.prototype)) {
-      resolve(null);
-      return;
-    }
+    if (!url) { resolve(null); return; }
     const video = document.createElement('video');
     video.src = url;
+    video.preload = 'auto';
     video.muted = true;
+    video.defaultMuted = true;
+    video.setAttribute('muted', '');
     video.playsInline = true;
+    video.setAttribute('playsinline', '');
     video.referrerPolicy = 'no-referrer';
-    video.style.cssText = 'position:fixed;width:1px;height:1px;opacity:0;pointer-events:none;';
+    video.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:160px;height:90px;';
     document.body.appendChild(video);
 
-    const samples = [];
     let done = false;
-    const finish = (fps) => {
+    const finish = (fps, reason) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
+      if (reason) console.warn('fps probe:', reason);
       video.pause();
       video.remove();
       resolve(fps);
     };
-    const timer = setTimeout(() => finish(null), timeoutMs);
+    const timer = setTimeout(() => finish(null, 'timed out waiting for playback'), timeoutMs);
 
-    function onFrame(_now, metadata) {
-      samples.push(metadata);
-      if (samples.length < 15) {
-        video.requestVideoFrameCallback(onFrame);
-        return;
-      }
-      const a = samples[0];
-      const b = samples[samples.length - 1];
-      const dt = b.mediaTime - a.mediaTime;
-      const df = b.presentedFrames - a.presentedFrames;
-      finish(dt > 0 && df > 0 ? df / dt : null);
+    // Path 1: requestVideoFrameCallback — precise, but support/timing varies
+    // across mobile browsers, so it's raced against Path 2 below.
+    if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+      const samples = [];
+      const onFrame = (_now, metadata) => {
+        samples.push(metadata);
+        if (samples.length < 15) { video.requestVideoFrameCallback(onFrame); return; }
+        const a = samples[0], b = samples[samples.length - 1];
+        const dt = b.mediaTime - a.mediaTime;
+        const df = b.presentedFrames - a.presentedFrames;
+        if (dt > 0 && df > 0) finish(df / dt);
+        else video.requestVideoFrameCallback(onFrame);
+      };
+      video.requestVideoFrameCallback(onFrame);
     }
 
-    video.addEventListener('loadeddata', () => {
-      video.play().catch((err) => { console.warn('fps probe: play() failed', err); finish(null); });
-      video.requestVideoFrameCallback(onFrame);
+    // Path 2: getVideoPlaybackQuality — broader support, used as a fallback
+    // (or the primary path where rVFC isn't available).
+    let qStart = null;
+    video.addEventListener('timeupdate', () => {
+      if (typeof video.getVideoPlaybackQuality !== 'function') return;
+      const q = video.getVideoPlaybackQuality();
+      const sample = { frames: q.totalVideoFrames, time: video.currentTime };
+      if (!qStart) { qStart = sample; return; }
+      const dt = sample.time - qStart.time;
+      const df = sample.frames - qStart.frames;
+      if (dt >= 1 && df > 0) finish(df / dt);
+    });
+
+    video.addEventListener('canplay', () => {
+      video.play().catch((err) => finish(null, `play() failed: ${err}`));
     });
     video.addEventListener('error', () => {
-      console.warn('fps probe: video failed to load', video.error);
-      finish(null);
+      finish(null, `video failed to load: ${video.error ? video.error.message : 'unknown'}`);
     });
   });
 }
