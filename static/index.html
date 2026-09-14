@@ -356,7 +356,7 @@ function measureFpsFromVideo(url, timeoutMs = 5000) {
     video.src = url;
     video.muted = true;
     video.playsInline = true;
-    video.crossOrigin = 'anonymous';
+    video.referrerPolicy = 'no-referrer';
     video.style.cssText = 'position:fixed;width:1px;height:1px;opacity:0;pointer-events:none;';
     document.body.appendChild(video);
 
@@ -386,10 +386,13 @@ function measureFpsFromVideo(url, timeoutMs = 5000) {
     }
 
     video.addEventListener('loadeddata', () => {
-      video.play().catch(() => finish(null));
+      video.play().catch((err) => { console.warn('fps probe: play() failed', err); finish(null); });
       video.requestVideoFrameCallback(onFrame);
     });
-    video.addEventListener('error', () => finish(null));
+    video.addEventListener('error', () => {
+      console.warn('fps probe: video failed to load', video.error);
+      finish(null);
+    });
   });
 }
 
