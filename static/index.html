@@ -295,6 +295,7 @@
       <div id="panelBody">
         <div class="row"><span class="label">Resolution</span><span class="value" id="resolution">–</span></div>
         <div class="row"><span class="label">Frame rate</span><span class="value" id="fps">–</span></div>
+        <div id="fpsDebug" style="display:none; font-family: var(--mono); font-size: 0.68rem; color: var(--muted); padding: 0 2px 8px; word-break: break-all;"></div>
         <div class="row"><span class="label">Video codec</span><span class="value" id="vcodec">–</span></div>
         <div class="row"><span class="label">Audio codec</span><span class="value" id="acodec">–</span></div>
         <div class="row"><span class="label">Bitrate</span><span class="value" id="bitrate">–</span></div>
@@ -348,7 +349,7 @@ function fmtBitrate(kbps) {
 // requestVideoFrameCallback.
 function measureFpsFromVideo(url, timeoutMs = 9000) {
   return new Promise((resolve) => {
-    if (!url) { resolve(null); return; }
+    if (!url) { resolve({ fps: null, reason: 'no play_url from server' }); return; }
     const video = document.createElement('video');
     video.src = url;
     video.preload = 'auto';
@@ -366,12 +367,11 @@ function measureFpsFromVideo(url, timeoutMs = 9000) {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      if (reason) console.warn('fps probe:', reason);
       video.pause();
       video.remove();
-      resolve(fps);
+      resolve({ fps, reason: fps ? null : (reason || 'unknown') });
     };
-    const timer = setTimeout(() => finish(null, 'timed out waiting for playback'), timeoutMs);
+    const timer = setTimeout(() => finish(null, 'timed out waiting for playback (9s)'), timeoutMs);
 
     // Path 1: requestVideoFrameCallback — precise, but support/timing varies
     // across mobile browsers, so it's raced against Path 2 below.
@@ -480,10 +480,16 @@ form.addEventListener('submit', async (e) => {
 
     if (!best.fps && best.play_url) {
       const fpsEl = document.getElementById('fps');
+      const debugEl = document.getElementById('fpsDebug');
       fpsEl.textContent = 'measuring…';
-      measureFpsFromVideo(best.play_url).then((measured) => {
+      debugEl.style.display = 'none';
+      measureFpsFromVideo(best.play_url).then(({ fps: measured, reason }) => {
         fpsEl.textContent = measured ? fmtFps(measured) : 'not reported';
         lastSummary = lastSummary.replace(/Frame rate: .*/, `Frame rate: ${measured ? fmtFps(measured) : 'not reported'}`);
+        if (!measured) {
+          debugEl.textContent = `debug: ${reason}`;
+          debugEl.style.display = 'block';
+        }
       });
     }
 
