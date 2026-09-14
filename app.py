@@ -15,29 +15,58 @@ FPS_LINE_RE = re.compile(r"(\d+(?:\.\d+)?)\s+fps")
 
 FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
 
-# TikTok's video CDN (v16-webapp-prime.us.tiktok.com etc.) blocks requests
-# from known datacenter/hosting IP ranges with a 403, which breaks the fps
-# probe on Render (and most other cloud hosts). Routing the download through
-# a residential/mobile proxy avoids that block. Set PROBE_PROXY_URL in the
-# environment, e.g. http://user:pass@proxy-host:port — works for both http
-# and https since it's passed as the scheme for both.
+# TikTok's own CDN (v16-webapp-prime.us.tiktok.com etc.) blocks requests from
+# datacenter/hosting IPs with a 403 — confirmed to fail even from a plain
+# browser tab, so it's not just an IP thing, the signed URL itself is locked
+# down. PROBE_PROXY_URL remains as an option for anyone who does have a
+# residential/mobile proxy, but it's no longer required (see tikwm below).
 PROBE_PROXY_URL = os.environ.get("PROBE_PROXY_URL")
 PROBE_PROXIES = {"http": PROBE_PROXY_URL, "https": PROBE_PROXY_URL} if PROBE_PROXY_URL else None
 
+# tikwm.com is a free public TikTok mirror/downloader — the same kind of
+# service millions of people use to save TikTok videos. It re-hosts the
+# actual file on its own domain, which (unlike TikTok's CDN) isn't locked to
+# a specific signed request, so Render's IP can download from it directly.
+# It's a third-party service with its own rate limits and no uptime
+# guarantee, so this is a best-effort lookup, not a hard dependency.
+TIKWM_API_URL = "https://tikwm.com/api/"
 
-def download_temp(raw_format, max_bytes=40 * 1024 * 1024, timeout=20):
-    """Pull the clip down to a temp file so ffmpeg can read it locally.
-    Probing the CDN URL directly gets blocked or truncated too often to
-    be reliable, so a real local copy is used instead."""
-    url = raw_format.get("url")
+
+def fetch_tikwm_play_url(tiktok_url, timeout=15):
+    """Ask tikwm.com for a re-hosted copy of the clip. Returns a play URL on
+    tikwm's own domain, or None if the lookup fails for any reason."""
+    try:
+        resp = requests.get(
+            TIKWM_API_URL,
+            params={"url": tiktok_url},
+            headers={"User-Agent": "Mozilla/5.0 (compatible; fps-probe/1.0)"},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        if payload.get("code") != 0:
+            app.logger.warning(f"tikwm lookup returned an error: {payload.get('msg')}")
+            return None
+        data = payload.get("data") or {}
+        return data.get("hdplay") or data.get("play")
+    except Exception as e:
+        app.logger.warning(f"tikwm lookup failed: {e}")
+        return None
+
+
+def probe_fps_from_url(url, headers=None, max_bytes=40 * 1024 * 1024, timeout=20, use_proxy=False):
+    """Download a copy of `url` to a temp file and read its real frame rate
+    with ffmpeg."""
     if not url:
         return None
-    headers = raw_format.get("http_headers") or {}
-
     path = None
     try:
         with requests.get(
-            url, headers=headers, stream=True, timeout=timeout, proxies=PROBE_PROXIES
+            url,
+            headers=headers or {},
+            stream=True,
+            timeout=timeout,
+            proxies=PROBE_PROXIES if use_proxy else None,
         ) as r:
             r.raise_for_status()
             fd, path = tempfile.mkstemp(suffix=".mp4")
@@ -50,22 +79,7 @@ def download_temp(raw_format, max_bytes=40 * 1024 * 1024, timeout=20):
                     size += len(chunk)
                     if size > max_bytes:
                         break
-        return path
-    except Exception as e:
-        app.logger.warning(f"fps probe download failed: {e}")
-        if path and os.path.exists(path):
-            os.remove(path)
-        return None
 
-
-def probe_fps(raw_format):
-    """Fall back to reading the real frame rate off the downloaded file
-    when TikTok's own metadata doesn't report one."""
-    path = download_temp(raw_format)
-    if not path:
-        return None
-
-    try:
         proc = subprocess.run(
             [FFMPEG_BIN, "-i", path, "-t", "0.1", "-f", "null", "-"],
             capture_output=True, text=True, timeout=15,
@@ -74,13 +88,14 @@ def probe_fps(raw_format):
         if match:
             return float(match.group(1))
         app.logger.warning(f"fps probe found no match. stderr tail: {proc.stderr[-400:]}")
-    except (subprocess.TimeoutExpired, OSError) as e:
-        app.logger.warning(f"fps probe ffmpeg run failed: {e}")
+    except Exception as e:
+        app.logger.warning(f"fps probe failed for {url}: {e}")
     finally:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
     return None
 
 
@@ -158,12 +173,23 @@ def check():
         best = formats[best_index]
         best_raw = raw_video_formats[best_index]
 
-    # TikTok doesn't always report fps in its own metadata. Try the
-    # video-level field first (free), then probe the actual file (slower).
+    # TikTok doesn't always report fps in its own metadata. Try progressively
+    # more expensive fallbacks: the video-level field (free), then a probe
+    # against a free mirror (tikwm.com), then — only if a proxy is
+    # configured — a probe against TikTok's own CDN directly.
     if best and not best.get("fps"):
         best["fps"] = info.get("fps")
+    tikwm_url = None
+    if best and not best.get("fps"):
+        tikwm_url = fetch_tikwm_play_url(url)
+        if tikwm_url:
+            best["fps"] = probe_fps_from_url(tikwm_url)
     if best and not best.get("fps") and best_raw and PROBE_PROXIES:
-        best["fps"] = probe_fps(best_raw)
+        best["fps"] = probe_fps_from_url(
+            best_raw.get("url"), headers=best_raw.get("http_headers"), use_proxy=True
+        )
+    if best and tikwm_url:
+        best["play_url"] = tikwm_url
 
     if best and best.get("fps") is None:
         best["fps_note"] = "not reported by TikTok for this video"
